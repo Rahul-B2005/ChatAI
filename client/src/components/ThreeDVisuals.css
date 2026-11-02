@@ -1,0 +1,26 @@
+
+.three-d-orb{
+  width:120px;height:120px;border-radius:50%;
+  position:relative;
+  background:radial-gradient(circle at 30% 24%,#fff 0 4%,#8be2cb 13%,#19a887 42%,#087b63 72%,#064f41 100%);
+  box-shadow:
+    inset -15px -18px 28px rgba(0,0,0,.20),
+    inset 12px 12px 22px rgba(255,255,255,.55),
+    0 25px 45px rgba(16,163,127,.24);
+  animation:threeDOrbFloat 5s ease-in-out infinite;
+}
+.three-d-orb::before{
+  content:"";position:absolute;inset:-16px;border-radius:50%;
+  border:1px solid rgba(22,160,133,.16);
+  transform:rotateX(70deg) rotateZ(12deg);
+}
+.three-d-orb::after{
+  content:"";position:absolute;width:28px;height:10px;
+  border-radius:50%;left:22px;top:17px;
+  background:rgba(255,255,255,.55);filter:blur(5px);
+  transform:rotate(-25deg);
+}
+@keyframes threeDOrbFloat{
+  0%,100%{transform:translateY(0) rotateZ(0)}
+  50%{transform:translateY(-8px) rotateZ(5deg)}
+}
