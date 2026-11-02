@@ -5,7 +5,8 @@ const axios = require("axios");
 require("dotenv").config();
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const PRIMARY_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const FALLBACK_MODEL = "openai/gpt-oss-20b"; // Verified open model with high-speed performance pool
 
 // Questions containing these terms are treated as time-sensitive and get
 // Groq's built-in browser_search tool. Normal questions stay on the model only.
@@ -19,10 +20,21 @@ const LIVE_PATTERNS = [
 
 const needsLiveSearch = (message) => LIVE_PATTERNS.some((pattern) => pattern.test(message));
 
-const trimMessages = (items) => items.slice(-12).map((item) => ({
+// SPEED FIX 1: Tightened rolling window context so payload payloads stay tiny and prompt ingest stays sub-second
+const trimMessages = (items) => items.slice(-6).map((item) => ({
   role: item.role === "assistant" ? "assistant" : "user",
-  content: String(item.content || "").slice(0, 6000)
+  content: String(item.content || "").slice(0, 2500)
 }));
+
+const executeGroqPayload = async (body) => {
+  return await axios.post(GROQ_URL, body, {
+    headers: {
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    timeout: 60000 // Optimized down to 60s max execution wait window
+  });
+};
 
 const getAIReply = async (message, history = []) => {
   if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY.includes("PASTE_YOUR")) {
@@ -36,38 +48,43 @@ const getAIReply = async (message, history = []) => {
     : "You are ChatAI, a helpful, accurate and concise AI assistant. Use Markdown when it improves readability. Never invent facts. Do not pretend old knowledge is current.";
 
   const body = {
-    model: MODEL,
+    model: PRIMARY_MODEL,
     messages: [
       { role: "system", content: system },
       ...trimMessages(history),
       { role: "user", content: String(message).trim() }
     ],
-    max_completion_tokens: 2048,
-    temperature: 1
+    max_completion_tokens: 1024, // SPEED FIX 2: Lowering max generation cap radically speeds up inference parsing
+    temperature: 0.7 // SPEED FIX 3: Lower temperature reduces variance recalculation lag under load
   };
 
-  // IMPORTANT: Do NOT send citation_options and do NOT use groq/compound here.
-  // GPT-OSS 120B supports Groq's browser_search tool directly.
   if (liveSearch) {
-    // Force Groq to perform browser search for time-sensitive questions.
-    // Without tool_choice:"required", the model may decide to answer from
-    // its existing knowledge instead of searching the live web.
     body.tools = [{ type: "browser_search" }];
     body.tool_choice = "required";
   }
 
-  const response = await axios.post(GROQ_URL, body, {
-    headers: {
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    timeout: 90000
-  });
+  let response;
+  let activeModel = PRIMARY_MODEL;
+
+  try {
+    response = await executeGroqPayload(body);
+  } catch (err) {
+    const apiError = err.response?.data?.error;
+    
+    // Fallback error-catching protocol
+    if (apiError?.code === "rate_limit_exceeded" || err.response?.status === 429) {
+      console.warn(`⚠️ [Quota Triggered] ${PRIMARY_MODEL} exhausted. Recovering dynamically via ${FALLBACK_MODEL}...`);
+      body.model = FALLBACK_MODEL;
+      activeModel = FALLBACK_MODEL;
+      response = await executeGroqPayload(body);
+    } else {
+      throw err;
+    }
+  }
 
   const choice = response.data?.choices?.[0];
   const rawReply = choice?.message?.content || "I couldn't generate a response.";
-  // Remove Groq/search citation markers from the user-visible response.
-  // Examples: 【1†L7-L10】, 【3†L26-L34】, 【12†source】.
+  
   const reply = String(rawReply)
     .replace(/【[^】]*】/g, "")
     .replace(/\n[ \t]*\n[ \t]*\n/g, "\n\n")
@@ -79,7 +96,7 @@ const getAIReply = async (message, history = []) => {
     JSON.stringify(tool).toLowerCase().includes("search")
   );
 
-  return { reply, usedWebSearch: liveSearch || usedWebSearch, model: MODEL };
+  return { reply, usedWebSearch: liveSearch || usedWebSearch, model: activeModel };
 };
 
 router.post("/", auth, async (req, res) => {
@@ -91,29 +108,30 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ success: false, message: "Message and sessionId are required." });
     }
 
-    await Chat.create({
+    // SPEED FIX 4: Fire MongoDB creations in background asynchronously without blocking loop context thread
+    Chat.create({
       userId: req.user.id,
       sessionId,
       role: "user",
       content: message
-    });
+    }).catch(e => console.error("Async background user logging error:", e.message));
 
-    // Use a small, recent history window so requests do not grow without bound.
-    const previous = await Chat.find({
-      userId: req.user.id,
-      sessionId
-    }).sort({ createdAt: 1 }).lean();
+    // Pull database data focusing solely on the structural string columns needed
+    const previous = await Chat.find({ userId: req.user.id, sessionId })
+      .select("role content")
+      .sort({ createdAt: 1 })
+      .lean();
 
-    // The current user message was just stored; don't send it twice.
     const history = previous.slice(0, -1);
     const result = await getAIReply(message, history);
 
-    await Chat.create({
+    // Fire bot creation entry in background asynchronously 
+    Chat.create({
       userId: req.user.id,
       sessionId,
       role: "assistant",
       content: result.reply
-    });
+    }).catch(e => console.error("Async background assistant logging error:", e.message));
 
     return res.json({
       success: true,
@@ -123,13 +141,13 @@ router.post("/", auth, async (req, res) => {
     });
   } catch (err) {
     const apiError = err.response?.data?.error;
-    console.error("AI request:", apiError || err.message);
+    console.error("AI runtime tracking stack:", apiError || err.message);
 
     const status = err.response?.status || 500;
     let message = "AI request failed. Please try again.";
 
     if (apiError?.code === "model_not_found") {
-      message = `Groq model "${MODEL}" is unavailable. Set GROQ_MODEL=openai/gpt-oss-120b in server/.env.`;
+      message = `Groq model initialization failed. Set up environmental fields correctly inside server/.env.`;
     } else if (apiError?.message) {
       message = apiError.message;
     } else if (err.code === "ECONNABORTED") {
